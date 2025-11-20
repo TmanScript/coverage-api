@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+geopandas
+shapely
+geopy
+beautifulsoup4
+lxml
+fiona
