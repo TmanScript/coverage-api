@@ -1,7 +1,7 @@
 import os
 import zipfile
 import tempfile
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -133,7 +133,7 @@ class CoverageChecker:
 # ==========================================
 # FASTAPI SETUP
 # ==========================================
-app = FastAPI(title="Coverage Check API (JSON Input)")
+app = FastAPI(title="Coverage Check API")
 
 checker = None
 try:
@@ -161,18 +161,39 @@ class CoverageResponse(BaseModel):
 class CoordsRequest(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    address: Optional[str] = None  # optional address field
+    address: Optional[str] = None
 
+# Chatrace payload
+class CustomField(BaseModel):
+    key: str
+    value: Optional[str]
+
+class ChatraceRequest(BaseModel):
+    id: str
+    account_id: str
+    full_name: Optional[str]
+    custom_fields: Optional[List[CustomField]] = []
 
 # ==========================================
-# MAIN ENDPOINT (JSON POST)
+# HELPER
+# ==========================================
+def extract_lat_lon(custom_fields: List[CustomField]):
+    lat = lon = None
+    for field in custom_fields:
+        if field.key.lower() in ["latitude", "lat"]:
+            lat = float(field.value)
+        elif field.key.lower() in ["longitude", "lon", "lng"]:
+            lon = float(field.value)
+    return lat, lon
+
+# ==========================================
+# MAIN ENDPOINT (JSON)
 # ==========================================
 @app.post("/check", response_model=CoverageResponse)
 async def check_coverage_json(req: CoordsRequest):
     if not checker:
         raise HTTPException(status_code=500, detail="Coverage map not loaded.")
 
-    # ---- CASE 1: Latitude + Longitude given ----
     if req.latitude is not None and req.longitude is not None:
         is_covered, details = checker.check_point(req.latitude, req.longitude)
         return CoverageResponse(
@@ -183,7 +204,6 @@ async def check_coverage_json(req: CoordsRequest):
             details=details
         )
 
-    # ---- CASE 2: Use address ----
     if req.address:
         if not geolocator:
             raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
@@ -204,9 +224,47 @@ async def check_coverage_json(req: CoordsRequest):
             details=details
         )
 
-    # ---- CASE 3: Neither coordinates nor address ----
     raise HTTPException(status_code=400, detail="JSON must include either latitude+longitude OR address.")
 
+# ==========================================
+# CHATRACE ENDPOINT
+# ==========================================
+@app.post("/check-chatrace", response_model=CoverageResponse)
+async def check_chatrace(req: ChatraceRequest):
+    if not checker:
+        raise HTTPException(status_code=500, detail="Coverage map not loaded.")
+
+    lat, lon = extract_lat_lon(req.custom_fields or [])
+    if lat is None or lon is None:
+        raise HTTPException(status_code=400, detail="Latitude or Longitude not found in custom_fields.")
+
+    is_covered, details = checker.check_point(lat, lon)
+
+    return CoverageResponse(
+        address="Coordinates Only",
+        latitude=lat,
+        longitude=lon,
+        in_coverage=is_covered,
+        details=details
+    )
+
+# ==========================================
+# OPTIONAL GET FOR BROWSER TESTING
+# ==========================================
+@app.get("/check-get", response_model=CoverageResponse)
+async def check_get(lat: float, lon: float):
+    if not checker:
+        raise HTTPException(status_code=500, detail="Coverage map not loaded.")
+
+    is_covered, details = checker.check_point(lat, lon)
+
+    return CoverageResponse(
+        address="Coordinates Only",
+        latitude=lat,
+        longitude=lon,
+        in_coverage=is_covered,
+        details=details
+    )
 
 # ==========================================
 # RUN SERVER
