@@ -8,7 +8,6 @@ from pydantic import BaseModel
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point, Polygon
-# --- CHANGED: Import GoogleV3 instead of Nominatim ---
 from geopy.geocoders import GoogleV3
 from bs4 import BeautifulSoup 
 
@@ -18,19 +17,11 @@ from bs4 import BeautifulSoup
 KMZ_FILE = "towers.kmz" 
 COVERAGE_RADIUS_KM = 5.0 
 
-
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-KMZ_FILE = "towers.kmz" 
-COVERAGE_RADIUS_KM = 5.0 
-
-# WE READ THE KEY FROM THE SERVER ENVIRONMENT, NOT THE CODE
+# Read Google Maps API key from environment
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY") 
 
 # ==========================================
-# LOGIC CLASS (Unchanged from previous working version)
+# COVERAGE CHECKER CLASS
 # ==========================================
 class CoverageChecker:
     def __init__(self, kmz_path):
@@ -142,10 +133,11 @@ class CoverageChecker:
 
         return False, None
 
+
 # ==========================================
-# API SETUP
+# FASTAPI SETUP
 # ==========================================
-app = FastAPI(title="Coverage Check API (Google Maps)")
+app = FastAPI(title="Coverage Check API (Google + Lat/Lon)")
 
 checker = None
 try:
@@ -153,13 +145,13 @@ try:
 except Exception as e:
     print(f"CRITICAL ERROR: Could not load KMZ. {e}")
 
-# --- CHANGED: Initialize Google Maps Geocoder ---
-# We use a timeout to prevent it from hanging if Google is slow
+# Initialize Google Maps geocoder
 try:
     geolocator = GoogleV3(api_key=GOOGLE_MAPS_API_KEY, timeout=10)
 except Exception as e:
     print("Warning: Google Maps API Key missing or invalid.")
     geolocator = None
+
 
 class CoverageResponse(BaseModel):
     address: str
@@ -168,23 +160,42 @@ class CoverageResponse(BaseModel):
     in_coverage: bool
     details: Optional[dict] = None
 
+
+# ==========================================
+# MAIN ENDPOINT: ADDRESS OR LAT/LON
+# ==========================================
 @app.get("/check", response_model=CoverageResponse)
-async def check_coverage(address: str = Query(..., description="Full address")):
+async def check_coverage(
+    address: Optional[str] = Query(None, description="Full address"),
+    latitude: Optional[float] = Query(None),
+    longitude: Optional[float] = Query(None)
+):
     if not checker:
         raise HTTPException(status_code=500, detail="Coverage map not loaded.")
-    
+
+    # CASE 1: Latitude & Longitude given → Skip Google
+    if latitude is not None and longitude is not None:
+        is_covered, details = checker.check_point(latitude, longitude)
+        return CoverageResponse(
+            address="Coordinates Only",
+            latitude=latitude,
+            longitude=longitude,
+            in_coverage=is_covered,
+            details=details
+        )
+
+    # CASE 2: Address required → Use Google
+    if not address:
+        raise HTTPException(status_code=400, detail="Either address OR latitude+longitude must be provided.")
+
     if not geolocator:
-         raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
+        raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
 
     try:
-        # Google Maps is much better at finding addresses like "11 Corona Avenue"
         location = geolocator.geocode(address)
-        
         if not location:
             raise HTTPException(status_code=404, detail="Address not found by Google Maps.")
-            
     except Exception as e:
-        # This catches invalid API keys or billing issues
         raise HTTPException(status_code=500, detail=f"Google Maps Error: {str(e)}")
 
     is_covered, details = checker.check_point(location.latitude, location.longitude)
@@ -197,6 +208,10 @@ async def check_coverage(address: str = Query(..., description="Full address")):
         details=details
     )
 
+
+# ==========================================
+# RUN SERVER
+# ==========================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
