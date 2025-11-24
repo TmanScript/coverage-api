@@ -1,7 +1,7 @@
 import os
 import zipfile
 import tempfile
-from typing import Optional, List
+from typing import Optional, List, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -69,7 +69,6 @@ class CoverageChecker:
                             desc = p.find('description').text if p.find('description') else ""
                             geometry = None
 
-                            # Point
                             point_tag = p.find('Point')
                             if point_tag:
                                 coords_tag = point_tag.find('coordinates')
@@ -78,12 +77,11 @@ class CoverageChecker:
                                     if coords:
                                         geometry = Point(coords[0])
 
-                            # Polygon
                             poly_tag = p.find('Polygon')
                             if poly_tag:
-                                outer_bound = poly_tag.find('outerBoundaryIs')
-                                if outer_bound:
-                                    coords_tag = outer_bound.find('coordinates')
+                                outer = poly_tag.find('outerBoundaryIs')
+                                if outer:
+                                    coords_tag = outer.find('coordinates')
                                     if coords_tag:
                                         coords = self.parse_coords_string(coords_tag.text)
                                         if len(coords) >= 3:
@@ -101,7 +99,6 @@ class CoverageChecker:
     def check_point(self, lat: float, lon: float):
         user_point = Point(lon, lat)
 
-        # Check Polygons
         if not self.polygons.empty:
             matches = self.polygons.contains(user_point)
             if matches.any():
@@ -110,7 +107,6 @@ class CoverageChecker:
                 details['match_type'] = 'Inside Polygon Coverage'
                 return True, details
 
-        # Check Towers
         if not self.points.empty:
             user_point_proj = gpd.GeoSeries([user_point], crs="EPSG:4326").to_crs("EPSG:3857")[0]
             points_proj = self.points.to_crs("EPSG:3857")
@@ -121,14 +117,15 @@ class CoverageChecker:
 
             if nearby_mask.any():
                 nearest_idx = distances.idxmin()
-                nearest_tower = self.points.iloc[nearest_idx].to_dict()
-                dist_val = distances.min()
-                details = {k: v for k, v in nearest_tower.items() if k != 'geometry'}
+                nearest = self.points.iloc[nearest_idx].to_dict()
+                dist = distances.min()
+                details = {k: v for k, v in nearest.items() if k != 'geometry'}
                 details['match_type'] = 'Tower Proximity'
-                details['distance_km'] = round(dist_val / 1000, 2)
+                details['distance_km'] = round(dist / 1000, 2)
                 return True, details
 
         return False, None
+
 
 # ==========================================
 # FASTAPI SETUP
@@ -141,11 +138,9 @@ try:
 except Exception as e:
     print(f"CRITICAL ERROR: Could not load KMZ. {e}")
 
-# Google Maps geocoder
 try:
     geolocator = GoogleV3(api_key=GOOGLE_MAPS_API_KEY, timeout=10)
-except Exception as e:
-    print("Warning: Google Maps API Key missing or invalid.")
+except:
     geolocator = None
 
 # ==========================================
@@ -158,36 +153,35 @@ class CoverageResponse(BaseModel):
     in_coverage: bool
     details: Optional[dict] = None
 
+
+# Accept strings OR floats
 class CoordsRequest(BaseModel):
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[Union[str, float]] = None
+    longitude: Optional[Union[str, float]] = None
     address: Optional[str] = None
 
-# Chatrace payload
-class CustomField(BaseModel):
-    key: str
-    value: Optional[str]
 
+# Chatrace model (generic dicts)
 class ChatraceRequest(BaseModel):
     id: str
     account_id: str
     full_name: Optional[str]
-    custom_fields: Optional[List[CustomField]] = []
+    custom_fields: Optional[List[dict]] = []
+
 
 # ==========================================
-# HELPER
+# HELPERS
 # ==========================================
-def extract_lat_lon(custom_fields: List[CustomField]):
-    lat = lon = None
+def extract_lat_lon(custom_fields: List[dict]):
     for field in custom_fields:
-        if field.key.lower() in ["latitude", "lat"]:
-            lat = float(field.value)
-        elif field.key.lower() in ["longitude", "lon", "lng"]:
-            lon = float(field.value)
-    return lat, lon
+        geo = field.get("geolocation")
+        if geo and "latitude" in geo and "longitude" in geo:
+            return float(geo["latitude"]), float(geo["longitude"])
+    return None, None
+
 
 # ==========================================
-# MAIN ENDPOINT (JSON)
+# POST /check  (supports strings)
 # ==========================================
 @app.post("/check", response_model=CoverageResponse)
 async def check_coverage_json(req: CoordsRequest):
@@ -195,24 +189,28 @@ async def check_coverage_json(req: CoordsRequest):
         raise HTTPException(status_code=500, detail="Coverage map not loaded.")
 
     if req.latitude is not None and req.longitude is not None:
-        is_covered, details = checker.check_point(req.latitude, req.longitude)
+        try:
+            lat = float(req.latitude)
+            lon = float(req.longitude)
+        except:
+            raise HTTPException(status_code=400, detail="Latitude and Longitude must be numbers.")
+
+        is_covered, details = checker.check_point(lat, lon)
+
         return CoverageResponse(
             address="Coordinates Only",
-            latitude=req.latitude,
-            longitude=req.longitude,
+            latitude=lat,
+            longitude=lon,
             in_coverage=is_covered,
             details=details
         )
 
     if req.address:
         if not geolocator:
-            raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
-        try:
-            location = geolocator.geocode(req.address)
-            if not location:
-                raise HTTPException(status_code=404, detail="Address not found by Google Maps.")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Google Maps Error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Google Maps API Key missing.")
+        location = geolocator.geocode(req.address)
+        if not location:
+            raise HTTPException(status_code=404, detail="Address not found.")
 
         is_covered, details = checker.check_point(location.latitude, location.longitude)
 
@@ -224,19 +222,18 @@ async def check_coverage_json(req: CoordsRequest):
             details=details
         )
 
-    raise HTTPException(status_code=400, detail="JSON must include either latitude+longitude OR address.")
+    raise HTTPException(status_code=400, detail="Send latitude+longitude OR address.")
+
 
 # ==========================================
-# CHATRACE ENDPOINT
+# POST /check-chatrace
 # ==========================================
 @app.post("/check-chatrace", response_model=CoverageResponse)
 async def check_chatrace(req: ChatraceRequest):
-    if not checker:
-        raise HTTPException(status_code=500, detail="Coverage map not loaded.")
-
     lat, lon = extract_lat_lon(req.custom_fields or [])
+
     if lat is None or lon is None:
-        raise HTTPException(status_code=400, detail="Latitude or Longitude not found in custom_fields.")
+        raise HTTPException(status_code=400, detail="Geolocation not found in custom_fields.")
 
     is_covered, details = checker.check_point(lat, lon)
 
@@ -248,16 +245,13 @@ async def check_chatrace(req: ChatraceRequest):
         details=details
     )
 
+
 # ==========================================
-# OPTIONAL GET FOR BROWSER TESTING
+# GET /check-get (browser testing)
 # ==========================================
 @app.get("/check-get", response_model=CoverageResponse)
 async def check_get(lat: float, lon: float):
-    if not checker:
-        raise HTTPException(status_code=500, detail="Coverage map not loaded.")
-
     is_covered, details = checker.check_point(lat, lon)
-
     return CoverageResponse(
         address="Coordinates Only",
         latitude=lat,
@@ -265,6 +259,7 @@ async def check_get(lat: float, lon: float):
         in_coverage=is_covered,
         details=details
     )
+
 
 # ==========================================
 # RUN SERVER
