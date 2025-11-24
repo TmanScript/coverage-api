@@ -3,22 +3,19 @@ import zipfile
 import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import geopandas as gpd
-import pandas as pd
 from shapely.geometry import Point, Polygon
 from geopy.geocoders import GoogleV3
-from bs4 import BeautifulSoup 
+from bs4 import BeautifulSoup
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-KMZ_FILE = "towers.kmz" 
-COVERAGE_RADIUS_KM = 5.0 
-
-# Read Google Maps API key from environment
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY") 
+KMZ_FILE = "towers.kmz"
+COVERAGE_RADIUS_KM = 5.0
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 # ==========================================
 # COVERAGE CHECKER CLASS
@@ -27,7 +24,7 @@ class CoverageChecker:
     def __init__(self, kmz_path):
         print(f"Loading KMZ: {kmz_path}...")
         self.gdf = self.load_kmz_manually(kmz_path)
-        
+
         if self.gdf.empty:
             print("WARNING: KMZ loaded but contains no data features!")
             self.polygons = gpd.GeoDataFrame()
@@ -56,22 +53,22 @@ class CoverageChecker:
                 kml_files = [f for f in z.namelist() if f.endswith('.kml')]
                 if not kml_files:
                     return gpd.GeoDataFrame()
-                
+
                 kml_file = kml_files[0]
                 z.extract(kml_file, temp_dir)
                 full_path = os.path.join(temp_dir, kml_file)
-                
+
                 print("Parsing KML XML directly...")
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                     soup = BeautifulSoup(f, 'xml')
                     placemarks = soup.find_all('Placemark')
-                    
+
                     for p in placemarks:
                         try:
                             name = p.find('name').text if p.find('name') else "Unknown"
                             desc = p.find('description').text if p.find('description') else ""
                             geometry = None
-                            
+
                             # Point
                             point_tag = p.find('Point')
                             if point_tag:
@@ -118,10 +115,10 @@ class CoverageChecker:
             user_point_proj = gpd.GeoSeries([user_point], crs="EPSG:4326").to_crs("EPSG:3857")[0]
             points_proj = self.points.to_crs("EPSG:3857")
             distances = points_proj.distance(user_point_proj)
-            
+
             radius_meters = COVERAGE_RADIUS_KM * 1000
             nearby_mask = distances <= radius_meters
-            
+
             if nearby_mask.any():
                 nearest_idx = distances.idxmin()
                 nearest_tower = self.points.iloc[nearest_idx].to_dict()
@@ -133,11 +130,10 @@ class CoverageChecker:
 
         return False, None
 
-
 # ==========================================
 # FASTAPI SETUP
 # ==========================================
-app = FastAPI(title="Coverage Check API (Google + Lat/Lon)")
+app = FastAPI(title="Coverage Check API (JSON Input)")
 
 checker = None
 try:
@@ -145,14 +141,16 @@ try:
 except Exception as e:
     print(f"CRITICAL ERROR: Could not load KMZ. {e}")
 
-# Initialize Google Maps geocoder
+# Google Maps geocoder
 try:
     geolocator = GoogleV3(api_key=GOOGLE_MAPS_API_KEY, timeout=10)
 except Exception as e:
     print("Warning: Google Maps API Key missing or invalid.")
     geolocator = None
 
-
+# ==========================================
+# MODELS
+# ==========================================
 class CoverageResponse(BaseModel):
     address: str
     latitude: float
@@ -160,53 +158,54 @@ class CoverageResponse(BaseModel):
     in_coverage: bool
     details: Optional[dict] = None
 
+class CoordsRequest(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    address: Optional[str] = None  # optional address field
+
 
 # ==========================================
-# MAIN ENDPOINT: ADDRESS OR LAT/LON
+# MAIN ENDPOINT (JSON POST)
 # ==========================================
-@app.get("/check", response_model=CoverageResponse)
-async def check_coverage(
-    address: Optional[str] = Query(None, description="Full address"),
-    latitude: Optional[float] = Query(None),
-    longitude: Optional[float] = Query(None)
-):
+@app.post("/check", response_model=CoverageResponse)
+async def check_coverage_json(req: CoordsRequest):
     if not checker:
         raise HTTPException(status_code=500, detail="Coverage map not loaded.")
 
-    # CASE 1: Latitude & Longitude given → Skip Google
-    if latitude is not None and longitude is not None:
-        is_covered, details = checker.check_point(latitude, longitude)
+    # ---- CASE 1: Latitude + Longitude given ----
+    if req.latitude is not None and req.longitude is not None:
+        is_covered, details = checker.check_point(req.latitude, req.longitude)
         return CoverageResponse(
             address="Coordinates Only",
-            latitude=latitude,
-            longitude=longitude,
+            latitude=req.latitude,
+            longitude=req.longitude,
             in_coverage=is_covered,
             details=details
         )
 
-    # CASE 2: Address required → Use Google
-    if not address:
-        raise HTTPException(status_code=400, detail="Either address OR latitude+longitude must be provided.")
+    # ---- CASE 2: Use address ----
+    if req.address:
+        if not geolocator:
+            raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
+        try:
+            location = geolocator.geocode(req.address)
+            if not location:
+                raise HTTPException(status_code=404, detail="Address not found by Google Maps.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Google Maps Error: {str(e)}")
 
-    if not geolocator:
-        raise HTTPException(status_code=500, detail="Google Maps API Key not configured.")
+        is_covered, details = checker.check_point(location.latitude, location.longitude)
 
-    try:
-        location = geolocator.geocode(address)
-        if not location:
-            raise HTTPException(status_code=404, detail="Address not found by Google Maps.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Google Maps Error: {str(e)}")
+        return CoverageResponse(
+            address=location.address,
+            latitude=location.latitude,
+            longitude=location.longitude,
+            in_coverage=is_covered,
+            details=details
+        )
 
-    is_covered, details = checker.check_point(location.latitude, location.longitude)
-
-    return CoverageResponse(
-        address=location.address,
-        latitude=location.latitude,
-        longitude=location.longitude,
-        in_coverage=is_covered,
-        details=details
-    )
+    # ---- CASE 3: Neither coordinates nor address ----
+    raise HTTPException(status_code=400, detail="JSON must include either latitude+longitude OR address.")
 
 
 # ==========================================
