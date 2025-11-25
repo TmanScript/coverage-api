@@ -9,6 +9,7 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon
 from geopy.geocoders import GoogleV3
 from bs4 import BeautifulSoup
+import json
 
 # ==========================================
 # CONFIGURATION
@@ -99,6 +100,7 @@ class CoverageChecker:
     def check_point(self, lat: float, lon: float):
         user_point = Point(lon, lat)
 
+        # POLYGON MATCH
         if not self.polygons.empty:
             matches = self.polygons.contains(user_point)
             if matches.any():
@@ -107,6 +109,7 @@ class CoverageChecker:
                 details['match_type'] = 'Inside Polygon Coverage'
                 return True, details
 
+        # POINT PROXIMITY
         if not self.points.empty:
             user_point_proj = gpd.GeoSeries([user_point], crs="EPSG:4326").to_crs("EPSG:3857")[0]
             points_proj = self.points.to_crs("EPSG:3857")
@@ -143,6 +146,7 @@ try:
 except:
     geolocator = None
 
+
 # ==========================================
 # MODELS
 # ==========================================
@@ -154,40 +158,49 @@ class CoverageResponse(BaseModel):
     details: Optional[dict] = None
 
 
-# Accept strings OR floats
 class CoordsRequest(BaseModel):
     latitude: Optional[Union[str, float]] = None
     longitude: Optional[Union[str, float]] = None
     address: Optional[str] = None
 
 
-# Chatrace model (generic dicts)
-class ChatraceRequest(BaseModel):
-    id: str
-    account_id: str
-    full_name: Optional[str]
-    custom_fields: Optional[List[dict]] = []
-
-
 # ==========================================
-# HELPERS
-# ==========================================
-def extract_lat_lon(custom_fields: List[dict]):
-    for field in custom_fields:
-        geo = field.get("geolocation")
-        if geo and "latitude" in geo and "longitude" in geo:
-            return float(geo["latitude"]), float(geo["longitude"])
-    return None, None
-
-
-# ==========================================
-# POST /check  (supports strings)
+# POST /check — Supports Chatrace JSON strings
 # ==========================================
 @app.post("/check", response_model=CoverageResponse)
 async def check_coverage_json(req: CoordsRequest):
     if not checker:
         raise HTTPException(status_code=500, detail="Coverage map not loaded.")
 
+    # ---------------------------
+    # A) FIX FOR CHATRACE STRING JSON
+    # ---------------------------
+    def parse_geo_string(value):
+        """Detect if Chatrace sent a JSON object inside a string."""
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("{") and value.endswith("}"):
+                try:
+                    return json.loads(value)
+                except:
+                    pass
+        return None
+
+    # Check latitude or longitude for embedded JSON
+    geo_from_lat = parse_geo_string(req.latitude)
+    geo_from_lon = parse_geo_string(req.longitude)
+
+    if geo_from_lat:
+        req.latitude = geo_from_lat.get("latitude")
+        req.longitude = geo_from_lat.get("longitude")
+
+    if geo_from_lon:
+        req.latitude = geo_from_lon.get("latitude")
+        req.longitude = geo_from_lon.get("longitude")
+
+    # ---------------------------
+    # B) Standard numeric handling
+    # ---------------------------
     if req.latitude is not None and req.longitude is not None:
         try:
             lat = float(req.latitude)
@@ -196,7 +209,6 @@ async def check_coverage_json(req: CoordsRequest):
             raise HTTPException(status_code=400, detail="Latitude and Longitude must be numbers.")
 
         is_covered, details = checker.check_point(lat, lon)
-
         return CoverageResponse(
             address="Coordinates Only",
             latitude=lat,
@@ -205,15 +217,18 @@ async def check_coverage_json(req: CoordsRequest):
             details=details
         )
 
+    # ---------------------------
+    # C) Address lookup
+    # ---------------------------
     if req.address:
         if not geolocator:
             raise HTTPException(status_code=500, detail="Google Maps API Key missing.")
+
         location = geolocator.geocode(req.address)
         if not location:
             raise HTTPException(status_code=404, detail="Address not found.")
 
         is_covered, details = checker.check_point(location.latitude, location.longitude)
-
         return CoverageResponse(
             address=location.address,
             latitude=location.latitude,
@@ -226,28 +241,7 @@ async def check_coverage_json(req: CoordsRequest):
 
 
 # ==========================================
-# POST /check-chatrace
-# ==========================================
-@app.post("/check-chatrace", response_model=CoverageResponse)
-async def check_chatrace(req: ChatraceRequest):
-    lat, lon = extract_lat_lon(req.custom_fields or [])
-
-    if lat is None or lon is None:
-        raise HTTPException(status_code=400, detail="Geolocation not found in custom_fields.")
-
-    is_covered, details = checker.check_point(lat, lon)
-
-    return CoverageResponse(
-        address="Coordinates Only",
-        latitude=lat,
-        longitude=lon,
-        in_coverage=is_covered,
-        details=details
-    )
-
-
-# ==========================================
-# GET /check-get (browser testing)
+# GET /check-get (easy browser testing)
 # ==========================================
 @app.get("/check-get", response_model=CoverageResponse)
 async def check_get(lat: float, lon: float):
