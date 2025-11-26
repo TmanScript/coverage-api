@@ -1,7 +1,8 @@
 import os
 import zipfile
 import tempfile
-from typing import Optional, List, Union
+import threading
+from typing import Optional, Union
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -17,6 +18,9 @@ import json
 KMZ_FILE = "towers.kmz"
 COVERAGE_RADIUS_KM = 5.0
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+
+checker_loaded = False   # Used for health check response
+
 
 # ==========================================
 # COVERAGE CHECKER CLASS
@@ -70,6 +74,7 @@ class CoverageChecker:
                             desc = p.find('description').text if p.find('description') else ""
                             geometry = None
 
+                            # POINT
                             point_tag = p.find('Point')
                             if point_tag:
                                 coords_tag = point_tag.find('coordinates')
@@ -78,6 +83,7 @@ class CoverageChecker:
                                     if coords:
                                         geometry = Point(coords[0])
 
+                            # POLYGON
                             poly_tag = p.find('Polygon')
                             if poly_tag:
                                 outer = poly_tag.find('outerBoundaryIs')
@@ -89,8 +95,12 @@ class CoverageChecker:
                                             geometry = Polygon(coords)
 
                             if geometry:
-                                features.append({'name': name, 'description': desc, 'geometry': geometry})
-                        except Exception:
+                                features.append({
+                                    'name': name,
+                                    'description': desc,
+                                    'geometry': geometry
+                                })
+                        except:
                             continue
 
         if not features:
@@ -100,7 +110,7 @@ class CoverageChecker:
     def check_point(self, lat: float, lon: float):
         user_point = Point(lon, lat)
 
-        # POLYGON MATCH
+        # POLYGON CHECK
         if not self.polygons.empty:
             matches = self.polygons.contains(user_point)
             if matches.any():
@@ -122,6 +132,7 @@ class CoverageChecker:
                 nearest_idx = distances.idxmin()
                 nearest = self.points.iloc[nearest_idx].to_dict()
                 dist = distances.min()
+
                 details = {k: v for k, v in nearest.items() if k != 'geometry'}
                 details['match_type'] = 'Tower Proximity'
                 details['distance_km'] = round(dist / 1000, 2)
@@ -136,15 +147,18 @@ class CoverageChecker:
 app = FastAPI(title="Coverage Check API")
 
 checker = None
-try:
-    checker = CoverageChecker(KMZ_FILE)
-except Exception as e:
-    print(f"CRITICAL ERROR: Could not load KMZ. {e}")
+geolocator = None
 
-try:
-    geolocator = GoogleV3(api_key=GOOGLE_MAPS_API_KEY, timeout=10)
-except:
-    geolocator = None
+
+# ==========================================
+# HEALTH CHECK (Used for cron-job wakeup)
+# ==========================================
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "kmz_loaded": checker_loaded
+    }
 
 
 # ==========================================
@@ -165,18 +179,15 @@ class CoordsRequest(BaseModel):
 
 
 # ==========================================
-# POST /check — Supports Chatrace JSON strings
+# POST /check
 # ==========================================
 @app.post("/check", response_model=CoverageResponse)
 async def check_coverage_json(req: CoordsRequest):
     if not checker:
-        raise HTTPException(status_code=500, detail="Coverage map not loaded.")
+        raise HTTPException(status_code=500, detail="Coverage checker still loading...")
 
-    # ---------------------------
-    # A) FIX FOR CHATRACE STRING JSON
-    # ---------------------------
+    # Fix Chatrace sending JSON inside a string
     def parse_geo_string(value):
-        """Detect if Chatrace sent a JSON object inside a string."""
         if isinstance(value, str):
             value = value.strip()
             if value.startswith("{") and value.endswith("}"):
@@ -186,7 +197,6 @@ async def check_coverage_json(req: CoordsRequest):
                     pass
         return None
 
-    # Check latitude or longitude for embedded JSON
     geo_from_lat = parse_geo_string(req.latitude)
     geo_from_lon = parse_geo_string(req.longitude)
 
@@ -198,9 +208,7 @@ async def check_coverage_json(req: CoordsRequest):
         req.latitude = geo_from_lon.get("latitude")
         req.longitude = geo_from_lon.get("longitude")
 
-    # ---------------------------
-    # B) Standard numeric handling
-    # ---------------------------
+    # Coordinates provided
     if req.latitude is not None and req.longitude is not None:
         try:
             lat = float(req.latitude)
@@ -217,14 +225,12 @@ async def check_coverage_json(req: CoordsRequest):
             details=details
         )
 
-    # ---------------------------
-    # C) Address lookup
-    # ---------------------------
+    # Address lookup
     if req.address:
         if not geolocator:
             raise HTTPException(status_code=500, detail="Google Maps API Key missing.")
-
         location = geolocator.geocode(req.address)
+
         if not location:
             raise HTTPException(status_code=404, detail="Address not found.")
 
@@ -241,10 +247,12 @@ async def check_coverage_json(req: CoordsRequest):
 
 
 # ==========================================
-# GET /check-get (easy browser testing)
+# GET /check-get
 # ==========================================
 @app.get("/check-get", response_model=CoverageResponse)
 async def check_get(lat: float, lon: float):
+    if not checker:
+        raise HTTPException(status_code=500, detail="Service still loading...")
     is_covered, details = checker.check_point(lat, lon)
     return CoverageResponse(
         address="Coordinates Only",
@@ -256,7 +264,31 @@ async def check_get(lat: float, lon: float):
 
 
 # ==========================================
-# RUN SERVER
+# BACKGROUND LOADER (Fast startup)
+# ==========================================
+def load_services():
+    global checker, geolocator, checker_loaded
+
+    try:
+        checker = CoverageChecker(KMZ_FILE)
+    except Exception as e:
+        print("ERROR loading KMZ:", e)
+
+    try:
+        geolocator = GoogleV3(api_key=GOOGLE_MAPS_API_KEY, timeout=10)
+    except:
+        pass
+
+    checker_loaded = True
+    print("KMZ + Google API Ready.")
+
+
+# Start background loading
+threading.Thread(target=load_services, daemon=True).start()
+
+
+# ==========================================
+# RUN SERVER (local only)
 # ==========================================
 if __name__ == "__main__":
     import uvicorn
